@@ -1,0 +1,80 @@
+name: Build Vethos APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'vethos-native-source.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android tools
+        run: |
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      - name: Extract ZIP
+        run: |
+          unzip -o vethos-native-source.zip -d source
+
+          PROJECT_DIR=$(find source -name settings.gradle.kts \
+            -type f -printf '%h\n' | head -n 1)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Error: Gradle project nahi mila."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found: $PROJECT_DIR"
+
+      - name: Download llama.cpp
+        run: |
+          if grep -R -q "llama.cpp" "$PROJECT_DIR/app/src/main/cpp" 2>/dev/null; then
+            if [ ! -d "$PROJECT_DIR/app/src/main/cpp/llama.cpp" ]; then
+              git clone --depth 1 \
+                https://github.com/ggml-org/llama.cpp.git \
+                "$PROJECT_DIR/app/src/main/cpp/llama.cpp"
+            fi
+          fi
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew --no-daemon assembleDebug
+          else
+            gradle --no-daemon assembleDebug
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vethos-Native-APK
+          path: source/**/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
