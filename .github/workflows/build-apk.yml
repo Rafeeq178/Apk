@@ -2,10 +2,6 @@ name: Build Vethos APK
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'vethos-native-source.zip'
-      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
@@ -24,57 +20,26 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android tools
+      - name: Install Android SDK tools
         run: |
-          sdkmanager --install \
+          sudo apt-get update
+          sudo apt-get install -y unzip zip wget
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/android-sdk.zip
+          mkdir -p /tmp/android-tools
+          unzip -q /tmp/android-sdk.zip -d /tmp/android-tools
+          mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+          cp -r /tmp/android-tools/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
             "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "ndk;27.2.12479018" \
-            "cmake;3.22.1"
+            "build-tools;35.0.0"
 
       - name: Extract ZIP
         run: |
           unzip -o vethos-native-source.zip -d source
 
-          PROJECT_DIR=$(find source -name settings.gradle.kts \
-            -type f -printf '%h\n' | head -n 1)
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "Error: Gradle project nahi mila."
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Project found: $PROJECT_DIR"
-
-      - name: Download llama.cpp
+      - name: Show extracted files
         run: |
-          if grep -R -q "llama.cpp" "$PROJECT_DIR/app/src/main/cpp" 2>/dev/null; then
-            if [ ! -d "$PROJECT_DIR/app/src/main/cpp/llama.cpp" ]; then
-              git clone --depth 1 \
-                https://github.com/ggml-org/llama.cpp.git \
-                "$PROJECT_DIR/app/src/main/cpp/llama.cpp"
-            fi
-          fi
-
-      - name: Build APK
-        run: |
-          cd "$PROJECT_DIR"
-
-          if [ -f gradlew ]; then
-            chmod +x gradlew
-            ./gradlew --no-daemon assembleDebug
-          else
-            gradle --no-daemon assembleDebug
-          fi
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Vethos-Native-APK
-          path: source/**/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 7
+          find source -maxdepth 3 -type f | head -200
