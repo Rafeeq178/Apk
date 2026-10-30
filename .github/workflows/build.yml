@@ -9,6 +9,9 @@ env:
   LLAMA_REF: b11669
   NDK_VERSION: 27.3.13750724
 
+permissions:
+  contents: write   # Release mein APK upload karne ke liye
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -78,13 +81,37 @@ jobs:
 
       - name: Build debug APK
         working-directory: vethos-native
-        run: gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee ../build.log
+        run: |
+          set -o pipefail   # warna tee gradle ki failure chhupa deta hai
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee ../build.log
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Verify APK (corrupt/unsigned na ho)
+        run: |
+          set -e
+          APK=vethos-native/app/build/outputs/apk/debug/app-debug.apk
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          ls -l "$APK"
+          unzip -tq "$APK"
+          "$BT/apksigner" verify --verbose "$APK"
+          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|sdkVersion|native-code"
+          sha256sum "$APK"
+          cp "$APK" Vethos-debug.apk
+
+      # Seedha .apk upload, zip nahi (upload-artifact v7+ ka archive:false)
+      - name: Upload APK (no zip)
+        uses: actions/upload-artifact@v7
         with:
-          name: Vethos-debug-apk
-          path: vethos-native/app/build/outputs/apk/debug/app-debug.apk
+          path: Vethos-debug.apk
+          archive: false
+
+      # Backup: Release page se seedha .apk download (Termux mein wget se bhi chalega)
+      - name: Publish APK to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vethos-build-${{ github.run_number }}
+          name: Vethos debug build ${{ github.run_number }}
+          prerelease: true
+          files: Vethos-debug.apk
 
       - name: Show only the real errors
         if: failure()
