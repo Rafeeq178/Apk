@@ -1,0 +1,234 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+env:
+  LLAMA_REF: b11669
+  NDK_VERSION: 27.3.13750724
+  APK_NAME: Vethos-debug.apk
+
+permissions:
+  contents: write   # Release mein APK upload karne ke liye
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Unzip project
+        run: unzip -q vethos-native-source.zip
+
+      - name: Install SDK parts
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;${NDK_VERSION}" > /dev/null
+          ls "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake"
+
+      - name: Fetch llama.cpp (pinned)
+        working-directory: vethos-native
+        run: |
+          DEST=app/src/main/cpp/llama.cpp
+          rm -rf "$DEST"
+          git clone --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp.git "$DEST" \
+            || { echo "::warning::tag not found, using master"; git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$DEST"; }
+          git -C "$DEST" log -1 --oneline
+
+      - name: Patch project for CI
+        working-directory: vethos-native
+        run: |
+          sed -i 's/abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")/abiFilters += listOf("arm64-v8a")/' app/build.gradle.kts
+          sed -i "s/compileSdk = 35/compileSdk = 35\n    ndkVersion = \"${NDK_VERSION}\"/" app/build.gradle.kts
+          cat > app/src/main/cpp/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(vethos_llama LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/CMakeLists.txt")
+            message(FATAL_ERROR "llama.cpp missing")
+          endif()
+          set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+          set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+          set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+          set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
+          add_subdirectory(llama.cpp)
+          add_library(vethos_llama SHARED native-lib.cpp)
+          find_library(log-lib log)
+          target_link_libraries(vethos_llama PRIVATE llama ${log-lib} android)
+          target_compile_options(vethos_llama PRIVATE -O3)
+          CMAKE
+          sed -i 's/^          //' app/src/main/cpp/CMakeLists.txt
+
+      - name: Build debug APK
+        working-directory: vethos-native
+        run: |
+          set -o pipefail   # warna tee gradle ki failure chhupa deta hai
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee ../build.log
+
+      - name: Verify APK (corrupt/unsigned na ho)
+        run: |
+          set -euo pipefail
+          APK=vethos-native/app/build/outputs/apk/debug/app-debug.apk
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          ls -l "$APK"
+          unzip -tq "$APK"
+          "$BT/apksigner" verify --verbose "$APK"
+          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|sdkVersion|native-code"
+          mkdir -p dist
+          cp "$APK" "dist/$APK_NAME"
+
+      - name: Make download-proof package
+        working-directory: dist
+        run: |
+          set -euo pipefail
+
+          # 1) Poori APK ka hash (sha256sum -c se check hota hai)
+          sha256sum "$APK_NAME" | tee "$APK_NAME.sha256"
+
+          # 2) Chhote tukde (3 MB). Ek tukda kharab ho to sirf wahi dobara download hota hai
+          split -b 3M -d -a 2 "$APK_NAME" "$APK_NAME.part"
+          sha256sum "$APK_NAME".part* > parts.sha256
+          cat parts.sha256
+
+          # 3) ZIP version (CRC check ke saath)
+          zip -q -9 Vethos-debug.zip "$APK_NAME"
+          zip -T Vethos-debug.zip
+
+          # 4) Termux ke liye auto-retry + verify script
+          cat > get-vethos.sh <<'SCRIPT'
+          #!/bin/sh
+          # Usage (Termux): pkg install wget -y && sh get-vethos.sh
+          BASE="https://github.com/@REPO@/releases/download/@TAG@"
+          APK="@APK@"
+
+          fetch() {  # fetch <file> : resume + retry
+            n=0
+            until wget -c -T 30 -q --show-progress "$BASE/$1"; do
+              n=$((n+1)); [ "$n" -ge 30 ] && return 1
+              echo "retry $n ..."; sleep 3
+            done
+          }
+
+          fetch "$APK.sha256" || { echo "hash file nahi mili"; exit 1; }
+
+          # Tareeqa 1: poori file
+          i=0
+          while [ "$i" -lt 5 ]; do
+            fetch "$APK" && sha256sum -c "$APK.sha256" && { echo "OK: $APK verified"; exit 0; }
+            echo "hash match nahi hua, dobara try ..."
+            rm -f "$APK"; i=$((i+1))
+          done
+
+          # Tareeqa 2: 3 MB ke tukde, har tukda alag verify
+          echo "Tukdon se download kar raha hoon ..."
+          rm -f parts.sha256
+          fetch parts.sha256 || exit 1
+          while read -r h f; do
+            n=0
+            until [ -f "$f" ] && echo "$h  $f" | sha256sum -c - >/dev/null 2>&1; do
+              rm -f "$f"; n=$((n+1))
+              [ "$n" -gt 15 ] && { echo "$f fail"; exit 1; }
+              fetch "$f"
+            done
+            echo "ok $f"
+          done < parts.sha256
+          cat "$APK".part* > "$APK"
+          sha256sum -c "$APK.sha256" && echo "OK: $APK verified" || exit 1
+          SCRIPT
+          sed -i 's/^          //' get-vethos.sh
+          sed -i "s|@REPO@|${GITHUB_REPOSITORY}|; s|@TAG@|vethos-build-${GITHUB_RUN_NUMBER}|; s|@APK@|${APK_NAME}|" get-vethos.sh
+          sh -n get-vethos.sh   # syntax check
+
+          ls -l
+
+      # Zip artifact (CRC ke saath). Nested zip se bachne ke liye folder upload ho raha hai
+      - name: Upload artifact (zip, CRC checked)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vethos-debug
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vethos-build-${{ github.run_number }}
+          name: Vethos debug build ${{ github.run_number }}
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/Vethos-debug.apk
+            dist/Vethos-debug.apk.sha256
+            dist/Vethos-debug.zip
+            dist/Vethos-debug.apk.part*
+            dist/parts.sha256
+            dist/get-vethos.sh
+
+      # Release se wapas download karke hash match karo (server side corruption check)
+      - name: Verify Release download (round trip)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="vethos-build-${{ github.run_number }}"
+          sleep 5
+          for i in 1 2 3 4 5; do
+            rm -rf check && mkdir check
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$APK_NAME" -p "$APK_NAME.sha256" -D check \
+               && (cd check && sha256sum -c "$APK_NAME.sha256"); then
+              echo "Round trip OK"; break
+            fi
+            [ "$i" = 5 ] && { echo "::error::Release APK hash mismatch"; exit 1; }
+            sleep 5
+          done
+
+      - name: Job summary (copy-paste Termux command)
+        run: |
+          TAG="vethos-build-${{ github.run_number }}"
+          HASH=$(cut -d' ' -f1 "dist/$APK_NAME.sha256")
+          {
+            echo "## Vethos APK ready"
+            echo
+            echo "SHA256: \`$HASH\`"
+            echo
+            echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo
+            echo "Termux (auto-retry + verify):"
+            echo '```'
+            echo "pkg install wget -y"
+            echo "wget https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/get-vethos.sh"
+            echo "sh get-vethos.sh"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show only the real errors
+        if: failure()
+        run: |
+          grep -nE "error:|e: |FAILED|What went wrong|CMake Error|undefined reference|fatal error" build.log | head -60 || true
+          tail -40 build.log
