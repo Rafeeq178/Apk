@@ -101,6 +101,30 @@ jobs:
           print('lib patched. ndk =', ndk.group(1) if ndk else 'default', '| cmake =', cm.group(1) if cm else 'default')
           PY
 
+      # llama.cpp's Android lib calls a few APIs newer than Android 10 (API 29).
+      # Replace them so the native code compiles for minSdk 29.
+      - name: Patch lib native sources for Android 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          root = pathlib.Path(os.environ['PROJECT_DIR']) / 'llama.cpp/examples/llama.android/lib/src/main/cpp'
+          # __android_log_is_loggable needs API 30 -> plain level check
+          pat = re.compile(r'__android_log_is_loggable\s*\(\s*([^,()]+?)\s*,[^;]*\)')
+          n = 0
+          for f in root.rglob('*'):
+              if f.suffix in ('.h', '.hpp', '.cpp', '.c', '.cc'):
+                  t = f.read_text(errors='ignore')
+                  t2 = pat.sub(r'((\1) >= ANDROID_LOG_INFO)', t)
+                  if t2 != t:
+                      f.write_text(t2); n += 1; print('patched', f)
+          print('files patched:', n)
+          PY
+          if grep -rn "__android_log_is_loggable" "$PROJECT_DIR/llama.cpp/examples/llama.android/lib/src/main/cpp"; then
+            echo "::error::__android_log_is_loggable still present"; exit 1
+          fi
+
       - name: Install Android SDK parts
         shell: bash
         run: |
@@ -270,7 +294,25 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          if [[ -f build.log ]]; then
-            grep -nE 'error:|e: |FAILED|What went wrong|CMake Error|undefined reference|fatal error' build.log | head -60 || true
-            tail -40 build.log
-          fi
+          [[ -f build.log ]] || exit 0
+          # first real compiler/linker errors, long command lines cut short
+          grep -nE 'error:|fatal error|undefined reference|undeclared|FAILED:|What went wrong|CMake Error' build.log \
+            | grep -v 'Werror' | cut -c1-260 | head -40 > first-errors.txt || true
+          cat first-errors.txt
+          {
+            echo '## Build failed - first errors'
+            echo '```'
+            cat first-errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            first-errors.txt
+          retention-days: 7
+          if-no-files-found: ignore
