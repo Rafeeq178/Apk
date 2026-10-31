@@ -87,6 +87,7 @@ jobs:
           s = s.replace('libs.androidx.datastore.preferences', '"androidx.datastore:datastore-preferences:1.1.1"')
           s = re.sub(r'^\s*(?:test|androidTest)Implementation\(libs\.[^\n]*\n', '', s, flags=re.M)
           s = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 35', s)
+          s = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = 29', s)   # Android 10+
           s = re.sub(r'abiFilters\s*\+=\s*listOf\([^)]*\)', 'abiFilters += listOf("arm64-v8a")', s)
           left = sorted(set(re.findall(r'libs\.[\w.]+', s)))
           if left:
@@ -124,7 +125,9 @@ jobs:
           done
           grep -q 'android:icon="@mipmap/ic_launcher"' "$M"
           grep -q 'android:roundIcon="@mipmap/ic_launcher_round"' "$M"
+          grep -q 'Theme.Vethos.Starting' "$RES/values/themes.xml"
           grep -q 'windowSplashScreenAnimatedIcon' "$RES/values/themes.xml"
+          grep -q 'Theme.Vethos.Starting' "$M"
           grep -q 'windowSplashScreenBackground' "$RES/values/themes.xml"
           grep -q '<monochrome' "$RES/mipmap-anydpi-v26/ic_launcher.xml"
           echo "Icon + splash resources OK"
@@ -147,6 +150,7 @@ jobs:
           "$BT/apksigner" verify --verbose "$APK"
           "$BT/aapt2" dump badging "$APK" > badging.txt
           grep -E "^package:|sdkVersion|native-code|launchable-activity|application-icon|application-label" badging.txt || true
+          grep -q "sdkVersion:'29'" badging.txt || { echo "::error::APK minSdk is not 29 (Android 10 will refuse to install it)"; exit 1; }
           grep -q "launchable-activity" badging.txt || { echo "::error::no launcher activity in APK"; exit 1; }
           grep -q "application-icon.*ic_launcher" badging.txt || { echo "::error::launcher icon missing in APK"; exit 1; }
           unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' | head -20
