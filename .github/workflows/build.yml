@@ -32,8 +32,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f Vethos.zip && ! -f settings.gradle.kts ]]; then
-            unzip -q -o Vethos.zip
+          if [[ ! -f settings.gradle.kts && -z "$(find . -maxdepth 2 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1)" ]]; then
+            Z=$(ls -t ./*.zip 2>/dev/null | head -n1 || true)
+            if [[ -n "$Z" ]]; then echo "Unzipping $Z"; unzip -q -o "$Z"; fi
           fi
           S=$(find . -maxdepth 2 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1 || true)
           if [[ -z "$S" ]]; then
@@ -44,6 +45,25 @@ jobs:
           test -f "$D/app/build.gradle.kts"
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
           echo "Project: $D"
+
+      # A fresh runner makes a NEW random debug key every build, so a new APK can not be
+      # installed over the old one ("App not installed"). Use one fixed debug.keystore
+      # (put it in the repo root or next to settings.gradle.kts) so updates install over each other.
+      - name: Use fixed debug signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          K=""
+          for c in "$PROJECT_DIR/debug.keystore" "debug.keystore"; do
+            [[ -f "$c" ]] && { K="$c"; break; }
+          done
+          if [[ -n "$K" ]]; then
+            mkdir -p "$HOME/.android"
+            cp "$K" "$HOME/.android/debug.keystore"
+            echo "Using fixed debug keystore: $K"
+          else
+            echo "::warning::debug.keystore not found - this APK gets a random signature; uninstall the old app before installing it."
+          fi
 
       - uses: actions/setup-java@v5
         with:
@@ -207,7 +227,9 @@ jobs:
           BT="$ANDROID_HOME/build-tools/35.0.0"
           test -s "$APK"
           unzip -tq "$APK"
-          "$BT/apksigner" verify --verbose "$APK"
+          "$BT/apksigner" verify --verbose --print-certs "$APK" | grep -E "Verifies|SHA-256|Signer #1 certificate DN" || true
+          SIGNER=$("$BT/apksigner" verify --print-certs "$APK" | sed -nE 's/.*certificate SHA-256 digest: ([0-9a-f]+).*/\1/p' | head -n1)
+          echo "APK_SIGNER=${SIGNER:0:16}" >> "$GITHUB_ENV"
           "$BT/aapt2" dump badging "$APK" > badging.txt
           "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" > manifest-tree.txt
           grep -E "^package:|^(min)?[sS]dkVersion|^targetSdkVersion|^native-code|^launchable-activity" badging.txt || true
@@ -410,6 +432,8 @@ jobs:
             echo "minSdk ${APK_MINSDK} (Android 10+) | arm64-v8a | llama.cpp ${LLAMA_REF} @ ${LLAMA_SHA} | NDK ${NDK_VERSION}"
             echo
             echo "SHA256: $HASH"
+            echo
+            echo "Signing key: ${APK_SIGNER:-unknown} (must stay the same between builds to install as an update)"
             echo
             echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
             echo
