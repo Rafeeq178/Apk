@@ -6,9 +6,10 @@ on:
     branches: [main, master]
 
 env:
-  LLAMA_REF: b11669        # pinned llama.cpp tag; falls back to master if the tag does not exist
-  NDK_VERSION: 27.3.13750724   # default only; the llama.cpp lib's own ndkVersion wins if it has one
+  LLAMA_REF: b11669            # pinned llama.cpp tag; falls back to master if the tag does not exist
+  NDK_VERSION: 29.0.13113456   # default only; the llama.cpp lib's own ndkVersion wins if it has one
   CMAKE_VERSION: 3.31.6        # default only; the lib's own cmake version wins if it has one
+  MIN_SDK: '29'                # Android 10
   APK_NAME: Vethos-debug.apk
 
 permissions:
@@ -23,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Works if the repo root IS the project, or the project is inside one
       # sub-folder (e.g. Vethos/), or you uploaded Vethos.zip.
@@ -49,7 +50,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.9'
 
@@ -63,10 +64,11 @@ jobs:
             echo "Fetched llama.cpp ref: $LLAMA_REF"
           else
             rm -rf "$DEST"
-            echo "::warning::LLAMA_REF '$LLAMA_REF' not found; using master"
+            echo "::warning::LLAMA_REF '$LLAMA_REF' not found; using master (build may differ from last time)"
             git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$DEST"
           fi
           git -C "$DEST" log -1 --oneline
+          echo "LLAMA_SHA=$(git -C "$DEST" rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
           test -f "$DEST/examples/llama.android/lib/build.gradle.kts" || {
             echo "::error::This llama.cpp ref has no examples/llama.android/lib module. Set LLAMA_REF to a newer tag or master."
             exit 1
@@ -87,7 +89,7 @@ jobs:
           s = s.replace('libs.androidx.datastore.preferences', '"androidx.datastore:datastore-preferences:1.1.1"')
           s = re.sub(r'^\s*(?:test|androidTest)Implementation\(libs\.[^\n]*\n', '', s, flags=re.M)
           s = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 35', s)
-          s = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = 29', s)   # Android 10+
+          s = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = ' + os.environ['MIN_SDK'], s)   # Android 10+
           s = re.sub(r'abiFilters\s*\+=\s*listOf\([^)]*\)', 'abiFilters += listOf("arm64-v8a")', s)
           left = sorted(set(re.findall(r'libs\.[\w.]+', s)))
           if left:
@@ -101,8 +103,8 @@ jobs:
           print('lib patched. ndk =', ndk.group(1) if ndk else 'default', '| cmake =', cm.group(1) if cm else 'default')
           PY
 
-      # llama.cpp's Android lib calls a few APIs newer than Android 10 (API 29).
-      # Replace them so the native code compiles for minSdk 29.
+      # llama.cpp's Android lib may call a few APIs newer than Android 10 (API 29).
+      # Replace them so the native code compiles and RUNS on minSdk 29.
       - name: Patch lib native sources for Android 10
         shell: bash
         run: |
@@ -124,17 +126,51 @@ jobs:
           if grep -rn "__android_log_is_loggable" "$PROJECT_DIR/llama.cpp/examples/llama.android/lib/src/main/cpp"; then
             echo "::error::__android_log_is_loggable still present"; exit 1
           fi
+          echo "--- how upstream loads the CPU backends (for reference) ---"
+          grep -rn "nativeLibraryDir\|ggml_backend_load_all_from_path" "$PROJECT_DIR/llama.cpp/examples/llama.android/lib/src/main" || true
+
+      # llama.cpp is built with dynamically loaded CPU backends
+      # (libggml-cpu-android_armv8.*.so). They are dlopen()ed from the app's
+      # nativeLibraryDir, which is EMPTY unless native libs are extracted at
+      # install time. Newer AGP defaults to "not extracted", so force it.
+      # Also make sure the app itself targets minSdk 29.
+      - name: Patch app (minSdk + extract native libs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path(os.environ['PROJECT_DIR']) / 'app/build.gradle.kts'
+          s = p.read_text()
+          s = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = ' + os.environ['MIN_SDK'], s)
+          if 'useLegacyPackaging' not in s:
+              s, n = re.subn(r'(\n\s*android\s*\{)', r'\1\n    packaging { jniLibs { useLegacyPackaging = true } }', s, count=1)
+              if n != 1:
+                  raise SystemExit('::error::could not find android { } block in app/build.gradle.kts')
+          p.write_text(s)
+          PY
+          grep -nE "minSdk|useLegacyPackaging" "$PROJECT_DIR/app/build.gradle.kts"
 
       - name: Install Android SDK parts
         shell: bash
         run: |
           set -euo pipefail
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses >/dev/null || true
-          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" >/dev/null
+          need=()
+          [[ -d "$ANDROID_HOME/platforms/android-35" ]]        || need+=("platforms;android-35")
+          [[ -d "$ANDROID_HOME/build-tools/35.0.0" ]]          || need+=("build-tools;35.0.0")
+          [[ -d "$ANDROID_HOME/cmake/$CMAKE_VERSION" ]]        || need+=("cmake;${CMAKE_VERSION}")
+          [[ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]]            || need+=("ndk;${NDK_VERSION}")
+          if (( ${#need[@]} )); then
+            echo "Installing: ${need[*]}"
+            yes | "$SDKM" --licenses >/dev/null || true
+            "$SDKM" "${need[@]}" | tail -n 5
+          else
+            echo "All SDK parts already on the runner image"
+          fi
           test -d "$ANDROID_HOME/ndk/$NDK_VERSION"
           test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION"
-          echo "ndk.dir ok: $NDK_VERSION, cmake ok: $CMAKE_VERSION"
+          echo "ndk ok: $NDK_VERSION | cmake ok: $CMAKE_VERSION"
 
       # The icon, adaptive/monochrome icon and splash screen live inside the
       # project (res/ + themes.xml). Fail early if anything is missing.
@@ -173,12 +209,35 @@ jobs:
           unzip -tq "$APK"
           "$BT/apksigner" verify --verbose "$APK"
           "$BT/aapt2" dump badging "$APK" > badging.txt
-          grep -E "^package:|sdkVersion|native-code|launchable-activity|application-icon|application-label" badging.txt || true
-          grep -q "sdkVersion:'29'" badging.txt || { echo "::error::APK minSdk is not 29 (Android 10 will refuse to install it)"; exit 1; }
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" > manifest-tree.txt
+          grep -E "^package:|^(min)?[sS]dkVersion|^targetSdkVersion|^native-code|^launchable-activity" badging.txt || true
+
+          # aapt2 prints minSdkVersion:'N' (older aapt printed sdkVersion:'N'); accept both,
+          # fall back to the binary manifest. Anything <= 29 installs on Android 10.
+          MIN=$(sed -nE "s/^(minSdkVersion|sdkVersion):'([0-9]+)'.*/\2/p" badging.txt | head -n1)
+          if [[ -z "$MIN" ]]; then
+            MIN=$(sed -nE 's/.*minSdkVersion\(0x[0-9a-f]+\)=([0-9]+).*/\1/p' manifest-tree.txt | head -n1)
+          fi
+          echo "APK minSdk = ${MIN:-unknown}"
+          [[ -n "$MIN" ]] || { echo "::error::could not read minSdk from APK"; exit 1; }
+          (( MIN <= MIN_SDK )) || { echo "::error::APK minSdk is $MIN, Android 10 (API 29) will refuse to install it"; exit 1; }
+          echo "APK_MINSDK=$MIN" >> "$GITHUB_ENV"
+
           grep -q "launchable-activity" badging.txt || { echo "::error::no launcher activity in APK"; exit 1; }
           grep -q "application-icon.*ic_launcher" badging.txt || { echo "::error::launcher icon missing in APK"; exit 1; }
-          unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' | head -20
-          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/.*\.so' || { echo "::error::no native arm64 libraries in APK"; exit 1; }
+          grep -q "native-code: *'arm64-v8a'" badging.txt || { echo "::error::APK is not arm64-v8a"; exit 1; }
+
+          # native libs must be extracted at install time, or the dlopen()ed CPU backends are not found
+          if grep -E "extractNativeLibs" manifest-tree.txt | grep -qE "=false|0x0$"; then
+            echo "::error::extractNativeLibs=false: llama.cpp CPU backends would not load on the phone"; exit 1
+          fi
+          grep -E "extractNativeLibs" manifest-tree.txt || echo "::warning::extractNativeLibs not set in manifest"
+
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' | head -30
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libai-chat\.so'    || { echo "::error::libai-chat.so missing"; exit 1; }
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libggml-cpu-.*\.so' || { echo "::error::no ggml CPU backend .so in APK"; exit 1; }
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libomp\.so'         || { echo "::error::libomp.so missing in APK"; exit 1; }
+
           mkdir -p dist
           cp "$APK" "dist/$APK_NAME"
           cd dist
@@ -187,6 +246,62 @@ jobs:
           sha256sum "$APK_NAME".part* > parts.sha256
           zip -q -9 Vethos-debug.zip "$APK_NAME"
           zip -T Vethos-debug.zip
+
+      # Extra Android 10 safety net (never fails the build): every symbol the
+      # native libs import must exist in Android 10's libc/libm/liblog/etc.
+      - name: Check native libs against Android 10 (API 29)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          LLVM="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
+          SYS="$LLVM/sysroot/usr/lib/aarch64-linux-android"
+          rm -rf so && mkdir so && unzip -q -j "$APK" 'lib/arm64-v8a/*.so' -d so
+          : > defined.txt
+          for f in "$SYS"/29/*.so "$SYS"/libc++_shared.so so/*.so; do
+            "$LLVM/bin/llvm-nm" -D --defined-only "$f" 2>/dev/null | awk 'NF{print $NF}' | sed 's/@.*//' >> defined.txt
+          done
+          sort -u defined.txt -o defined.txt
+          bad=0
+          for f in so/*.so; do
+            miss=$("$LLVM/bin/llvm-nm" -D --undefined-only "$f" 2>/dev/null | awk '$1=="U"{print $2}' | sed 's/@.*//' | sort -u | comm -23 - defined.txt)
+            if [[ -n "$miss" ]]; then
+              bad=1
+              echo "::warning::$(basename "$f") imports symbols not found on API 29: $(echo "$miss" | head -n 8 | tr '\n' ' ')"
+            fi
+          done
+          [[ $bad == 0 ]] && echo "No API>29 native symbols found (good for Android 10)"
+          echo "--- ELF LOAD alignment (16 KB = 0x4000 is needed for Android 15+ 16KB devices) ---"
+          for f in so/libai-chat.so so/libllama.so; do
+            echo "$f: $("$LLVM/bin/llvm-readelf" -lW "$f" 2>/dev/null | awk '$1=="LOAD"{print $NF}' | sort -u | tr '\n' ' ')"
+          done
+          exit 0
+
+      # Lint's NewApi check reports Kotlin/Java calls to APIs newer than Android 10.
+      # Informational only: warnings, never fails the build.
+      - name: Lint for APIs newer than Android 10
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon :app:lintDebug > "$GITHUB_WORKSPACE/lint.log" 2>&1 || true
+          tail -n 5 "$GITHUB_WORKSPACE/lint.log"
+          python3 - <<'PY'
+          import os, glob
+          import xml.etree.ElementTree as ET
+          found = 0
+          for f in glob.glob('app/build/reports/lint-results-debug.xml'):
+              for i in ET.parse(f).getroot().iter('issue'):
+                  if i.get('id') in ('NewApi', 'InlinedApi', 'ObsoleteSdkInt') and i.get('severity') in ('Error', 'Fatal', 'Warning'):
+                      if i.get('id') == 'ObsoleteSdkInt':
+                          continue
+                      loc = i.find('location')
+                      where = (loc.get('file', '?').split('/app/')[-1] + ':' + loc.get('line', '?')) if loc is not None else '?'
+                      print('::warning::[%s] %s (%s)' % (i.get('id'), i.get('message'), where))
+                      found += 1
+          print('API>29 findings:', found)
+          PY
 
       - name: Create Termux download helper
         shell: bash
@@ -228,8 +343,21 @@ jobs:
           chmod +x get-vethos.sh
           sh -n get-vethos.sh
 
+      - name: Write release notes
+        shell: bash
+        run: |
+          {
+            echo "Vethos debug build ${GITHUB_RUN_NUMBER}"
+            echo
+            echo "- Android 10+ (minSdk ${APK_MINSDK}), arm64-v8a only"
+            echo "- llama.cpp ref: ${LLAMA_REF} (commit ${LLAMA_SHA})"
+            echo "- NDK ${NDK_VERSION}"
+            echo "- SHA256: $(cut -d' ' -f1 "dist/$APK_NAME.sha256")"
+          } > release-notes.md
+          cat release-notes.md
+
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Vethos-debug
           path: dist/
@@ -237,10 +365,11 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: vethos-build-${{ github.run_number }}
           name: Vethos debug build ${{ github.run_number }}
+          body_path: release-notes.md
           prerelease: true
           fail_on_unmatched_files: true
           files: |
@@ -278,6 +407,8 @@ jobs:
           {
             echo '## Vethos APK ready'
             echo
+            echo "minSdk ${APK_MINSDK} (Android 10+) | arm64-v8a | llama.cpp ${LLAMA_REF} @ ${LLAMA_SHA} | NDK ${NDK_VERSION}"
+            echo
             echo "SHA256: $HASH"
             echo
             echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
@@ -308,11 +439,13 @@ jobs:
 
       - name: Upload build log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-log
           path: |
             build.log
             first-errors.txt
+            badging.txt
+            manifest-tree.txt
           retention-days: 7
           if-no-files-found: ignore
