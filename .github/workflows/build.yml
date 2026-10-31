@@ -6,12 +6,13 @@ on:
     branches: [main, master]
 
 env:
-  LLAMA_REF: b11669
-  NDK_VERSION: 27.3.13750724
+  LLAMA_REF: b11669        # pinned llama.cpp tag; falls back to master if the tag does not exist
+  NDK_VERSION: 27.3.13750724   # default only; the llama.cpp lib's own ndkVersion wins if it has one
+  CMAKE_VERSION: 3.31.6        # default only; the lib's own cmake version wins if it has one
   APK_NAME: Vethos-debug.apk
 
 permissions:
-  contents: write   # Release mein APK upload karne ke liye
+  contents: write
 
 concurrency:
   group: build-apk
@@ -24,265 +25,182 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Works if the repo root IS the project, or the project is inside one
+      # sub-folder (e.g. Vethos/), or you uploaded Vethos.zip.
+      - name: Locate project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f Vethos.zip && ! -f settings.gradle.kts ]]; then
+            unzip -q -o Vethos.zip
+          fi
+          S=$(find . -maxdepth 2 -name settings.gradle.kts -not -path '*/llama.cpp/*' | head -n1 || true)
+          if [[ -z "$S" ]]; then
+            echo "::error::settings.gradle.kts not found. Put the Vethos project (or Vethos.zip) in the repo."
+            exit 1
+          fi
+          D=$(dirname "$S")
+          test -f "$D/app/build.gradle.kts"
+          echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
+          echo "Project: $D"
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
-      - name: Unzip project
-        run: unzip -q vethos-native-source.zip
-
-      - name: Install SDK parts
-        run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses > /dev/null || true
-          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;${NDK_VERSION}" > /dev/null
-          ls "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake"
-
-      - name: Fetch llama.cpp (pinned)
-        working-directory: vethos-native
-        run: |
-          DEST=app/src/main/cpp/llama.cpp
-          rm -rf "$DEST"
-          git clone --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp.git "$DEST" \
-            || { echo "::warning::tag not found, using master"; git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$DEST"; }
-          git -C "$DEST" log -1 --oneline
-
-      - name: Patch project for CI
-        working-directory: vethos-native
-        run: |
-          sed -i 's/abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")/abiFilters += listOf("arm64-v8a")/' app/build.gradle.kts
-          sed -i "s/compileSdk = 35/compileSdk = 35\n    ndkVersion = \"${NDK_VERSION}\"/" app/build.gradle.kts
-          cat > app/src/main/cpp/CMakeLists.txt <<'CMAKE'
-          cmake_minimum_required(VERSION 3.22.1)
-          project(vethos_llama LANGUAGES C CXX)
-          set(CMAKE_CXX_STANDARD 17)
-          set(CMAKE_CXX_STANDARD_REQUIRED ON)
-          if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/CMakeLists.txt")
-            message(FATAL_ERROR "llama.cpp missing")
-          endif()
-          set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
-          set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
-          set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
-          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-          set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
-          add_subdirectory(llama.cpp)
-          add_library(vethos_llama SHARED native-lib.cpp)
-          find_library(log-lib log)
-          target_link_libraries(vethos_llama PRIVATE llama ${log-lib} android)
-          target_compile_options(vethos_llama PRIVATE -O3)
-          CMAKE
-          sed -i 's/^          //' app/src/main/cpp/CMakeLists.txt
-
-      - name: Add app icon and splash screen
-        working-directory: vethos-native
+      - name: Fetch llama.cpp
+        shell: bash
         run: |
           set -euo pipefail
-          RES=app/src/main/res
-          mkdir -p $RES/drawable $RES/values $RES/values-v31 $RES/mipmap-anydpi-v26
+          DEST="$PROJECT_DIR/llama.cpp"      # settings.gradle.kts expects it here
+          rm -rf "$DEST"
+          if git clone --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp.git "$DEST"; then
+            echo "Fetched llama.cpp ref: $LLAMA_REF"
+          else
+            rm -rf "$DEST"
+            echo "::warning::LLAMA_REF '$LLAMA_REF' not found; using master"
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$DEST"
+          fi
+          git -C "$DEST" log -1 --oneline
+          test -f "$DEST/examples/llama.android/lib/build.gradle.kts" || {
+            echo "::error::This llama.cpp ref has no examples/llama.android/lib module. Set LLAMA_REF to a newer tag or master."
+            exit 1
+          }
 
-          # Rang (yahan se badal sakte hain)
-          cat > $RES/values/vethos_icon_colors.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <color name="vethos_icon_bg">#F6F1E7</color>
-              <color name="vethos_icon_fg">#C4573A</color>
-          </resources>
-          EOF
-
-          # Icon ka nishan: V + 3 nuqte (adaptive icon ke safe zone ke andar)
-          cat > $RES/drawable/vethos_icon_fg.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp" android:height="108dp"
-              android:viewportWidth="108" android:viewportHeight="108">
-              <path
-                  android:pathData="M37,40 L54,70 L71,40"
-                  android:strokeColor="@color/vethos_icon_fg"
-                  android:strokeWidth="6.5"
-                  android:strokeLineCap="round"
-                  android:strokeLineJoin="round"
-                  android:fillColor="#00000000" />
-              <path
-                  android:fillColor="@color/vethos_icon_fg"
-                  android:pathData="M37,35.5m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0" />
-              <path
-                  android:fillColor="@color/vethos_icon_fg"
-                  android:pathData="M71,35.5m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0" />
-              <path
-                  android:fillColor="@color/vethos_icon_fg"
-                  android:pathData="M54,76m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0" />
-          </vector>
-          EOF
-
-          for N in vethos_icon vethos_icon_round; do
-          cat > $RES/mipmap-anydpi-v26/$N.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/vethos_icon_bg" />
-              <foreground android:drawable="@drawable/vethos_icon_fg" />
-              <monochrome android:drawable="@drawable/vethos_icon_fg" />
-          </adaptive-icon>
-          EOF
-          done
-
-          # Purane Android (11 tak) ka splash: cream background + beech mein icon
-          cat > $RES/drawable/vethos_launch_bg.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-              <item android:drawable="@color/vethos_icon_bg" />
-              <item
-                  android:width="140dp" android:height="140dp"
-                  android:gravity="center"
-                  android:drawable="@drawable/vethos_icon_fg" />
-          </layer-list>
-          EOF
-
-          cat > $RES/values/vethos_launch_theme.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="Theme.Vethos.Launch" parent="__PARENT__">
-                  <item name="android:windowBackground">@drawable/vethos_launch_bg</item>
-              </style>
-          </resources>
-          EOF
-
-          # Android 12+ ka system splash
-          cat > $RES/values-v31/vethos_launch_theme.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="Theme.Vethos.Launch" parent="__PARENT__">
-                  <item name="android:windowBackground">@drawable/vethos_launch_bg</item>
-                  <item name="android:windowSplashScreenBackground">@color/vethos_icon_bg</item>
-                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/vethos_icon_fg</item>
-              </style>
-          </resources>
-          EOF
-
-          # Manifest mein icon + theme jodo, purani theme ko parent bana do
+      - name: Prepare llama.cpp Android lib
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
-          import re
-          p = "app/src/main/AndroidManifest.xml"
-          s = open(p, encoding="utf-8").read()
-          m = re.search(r"<application\b[^>]*>", s, re.S)
-          tag = m.group(0)
-          t = re.search(r'android:theme="([^"]*)"', tag)
-          parent = t.group(1) if t else "@android:style/Theme.Material.Light.NoActionBar"
-
-          def put(tag, name, val):
-              if re.search(name + r'="[^"]*"', tag):
-                  return re.sub(name + r'="[^"]*"', name + '="' + val + '"', tag)
-              return tag[:-1].rstrip() + '\n        ' + name + '="' + val + '">'
-
-          new = tag
-          new = put(new, "android:icon", "@mipmap/vethos_icon")
-          new = put(new, "android:roundIcon", "@mipmap/vethos_icon_round")
-          new = put(new, "android:theme", "@style/Theme.Vethos.Launch")
-          s = s.replace(tag, new, 1)
-          open(p, "w", encoding="utf-8").write(s)
-
-          for f in ("app/src/main/res/values/vethos_launch_theme.xml",
-                    "app/src/main/res/values-v31/vethos_launch_theme.xml"):
-              x = open(f, encoding="utf-8").read().replace("__PARENT__", parent)
-              open(f, "w", encoding="utf-8").write(x)
-          print("parent theme:", parent)
+          import os, re, pathlib
+          p = pathlib.Path(os.environ['PROJECT_DIR']) / 'llama.cpp/examples/llama.android/lib/build.gradle.kts'
+          s = p.read_text()
+          # upstream uses a version catalog; swap it for plain ids/coordinates
+          s = s.replace('alias(libs.plugins.android.library)', 'id("com.android.library")')
+          s = re.sub(r'alias\(libs\.plugins\.(?:jetbrains\.)?kotlin\.android\)', 'id("org.jetbrains.kotlin.android")', s)
+          s = s.replace('libs.androidx.core.ktx', '"androidx.core:core-ktx:1.13.1"')
+          s = s.replace('libs.androidx.datastore.preferences', '"androidx.datastore:datastore-preferences:1.1.1"')
+          s = re.sub(r'^\s*(?:test|androidTest)Implementation\(libs\.[^\n]*\n', '', s, flags=re.M)
+          s = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 35', s)
+          s = re.sub(r'abiFilters\s*\+=\s*listOf\([^)]*\)', 'abiFilters += listOf("arm64-v8a")', s)
+          left = sorted(set(re.findall(r'libs\.[\w.]+', s)))
+          if left:
+              raise SystemExit('::error::unresolved version-catalog refs in lib/build.gradle.kts: ' + ', '.join(left))
+          p.write_text(s)
+          ndk = re.search(r'ndkVersion\s*=\s*"([^"]+)"', s)
+          cm = re.search(r'(?<![A-Za-z])version\s*=\s*"(\d+\.\d+[\d.]*)"', s)
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              if ndk: f.write('NDK_VERSION=' + ndk.group(1) + '\n')
+              if cm: f.write('CMAKE_VERSION=' + cm.group(1) + '\n')
+          print('lib patched. ndk =', ndk.group(1) if ndk else 'default', '| cmake =', cm.group(1) if cm else 'default')
           PY
-          grep -n -A6 "<application" app/src/main/AndroidManifest.xml
+
+      - name: Install Android SDK parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "cmake;${CMAKE_VERSION}" "ndk;${NDK_VERSION}" >/dev/null
+          test -d "$ANDROID_HOME/ndk/$NDK_VERSION"
+          test -d "$ANDROID_HOME/cmake/$CMAKE_VERSION"
+          echo "ndk.dir ok: $NDK_VERSION, cmake ok: $CMAKE_VERSION"
+
+      # The icon, adaptive/monochrome icon and splash screen live inside the
+      # project (res/ + themes.xml). Fail early if anything is missing.
+      - name: Check icon and splash resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          RES="$PROJECT_DIR/app/src/main/res"
+          M="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          for f in mipmap-anydpi-v26/ic_launcher.xml mipmap-anydpi-v26/ic_launcher_round.xml drawable/ic_launcher_fg.xml values/colors.xml values/themes.xml; do
+            test -s "$RES/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          grep -q 'android:icon="@mipmap/ic_launcher"' "$M"
+          grep -q 'android:roundIcon="@mipmap/ic_launcher_round"' "$M"
+          grep -q 'windowSplashScreenAnimatedIcon' "$RES/values/themes.xml"
+          grep -q 'windowSplashScreenBackground' "$RES/values/themes.xml"
+          grep -q '<monochrome' "$RES/mipmap-anydpi-v26/ic_launcher.xml"
+          echo "Icon + splash resources OK"
 
       - name: Build debug APK
-        working-directory: vethos-native
+        shell: bash
         run: |
-          set -o pipefail   # warna tee gradle ki failure chhupa deta hai
-          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee ../build.log
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: Verify APK (corrupt/unsigned na ho)
+      - name: Verify APK and prepare downloads
+        shell: bash
         run: |
           set -euo pipefail
-          APK=vethos-native/app/build/outputs/apk/debug/app-debug.apk
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          ls -l "$APK"
+          test -s "$APK"
           unzip -tq "$APK"
           "$BT/apksigner" verify --verbose "$APK"
-          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|sdkVersion|native-code"
+          "$BT/aapt2" dump badging "$APK" > badging.txt
+          grep -E "^package:|sdkVersion|native-code|launchable-activity|application-icon|application-label" badging.txt || true
+          grep -q "launchable-activity" badging.txt || { echo "::error::no launcher activity in APK"; exit 1; }
+          grep -q "application-icon.*ic_launcher" badging.txt || { echo "::error::launcher icon missing in APK"; exit 1; }
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/.*\.so' | head -20
+          unzip -l "$APK" | grep -qE 'lib/arm64-v8a/.*\.so' || { echo "::error::no native arm64 libraries in APK"; exit 1; }
           mkdir -p dist
           cp "$APK" "dist/$APK_NAME"
-
-      - name: Make download-proof package
-        working-directory: dist
-        run: |
-          set -euo pipefail
-
-          # 1) Poori APK ka hash (sha256sum -c se check hota hai)
+          cd dist
           sha256sum "$APK_NAME" | tee "$APK_NAME.sha256"
-
-          # 2) Chhote tukde (3 MB). Ek tukda kharab ho to sirf wahi dobara download hota hai
           split -b 3M -d -a 2 "$APK_NAME" "$APK_NAME.part"
           sha256sum "$APK_NAME".part* > parts.sha256
-          cat parts.sha256
-
-          # 3) ZIP version (CRC check ke saath)
           zip -q -9 Vethos-debug.zip "$APK_NAME"
           zip -T Vethos-debug.zip
 
-          # 4) Termux ke liye auto-retry + verify script
+      - name: Create Termux download helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
           cat > get-vethos.sh <<'SCRIPT'
           #!/bin/sh
-          # Usage (Termux): pkg install wget -y && sh get-vethos.sh
           BASE="https://github.com/@REPO@/releases/download/@TAG@"
           APK="@APK@"
-
-          fetch() {  # fetch <file> : resume + retry
+          fetch() {
             n=0
             until wget -c -T 30 -q --show-progress "$BASE/$1"; do
               n=$((n+1)); [ "$n" -ge 30 ] && return 1
               echo "retry $n ..."; sleep 3
             done
           }
-
           fetch "$APK.sha256" || { echo "hash file nahi mili"; exit 1; }
-
-          # Tareeqa 1: poori file
           i=0
           while [ "$i" -lt 5 ]; do
             fetch "$APK" && sha256sum -c "$APK.sha256" && { echo "OK: $APK verified"; exit 0; }
-            echo "hash match nahi hua, dobara try ..."
             rm -f "$APK"; i=$((i+1))
           done
-
-          # Tareeqa 2: 3 MB ke tukde, har tukda alag verify
           echo "Tukdon se download kar raha hoon ..."
           rm -f parts.sha256
           fetch parts.sha256 || exit 1
           while read -r h f; do
             n=0
             until [ -f "$f" ] && echo "$h  $f" | sha256sum -c - >/dev/null 2>&1; do
-              rm -f "$f"; n=$((n+1))
-              [ "$n" -gt 15 ] && { echo "$f fail"; exit 1; }
-              fetch "$f"
+              rm -f "$f"; n=$((n+1)); [ "$n" -gt 15 ] && exit 1
+              fetch "$f" </dev/null || exit 1
             done
-            echo "ok $f"
           done < parts.sha256
           cat "$APK".part* > "$APK"
-          sha256sum -c "$APK.sha256" && echo "OK: $APK verified" || exit 1
+          sha256sum -c "$APK.sha256"
           SCRIPT
-          sed -i 's/^          //' get-vethos.sh
+          # YAML already removed the block indent; nothing else to strip
           sed -i "s|@REPO@|${GITHUB_REPOSITORY}|; s|@TAG@|vethos-build-${GITHUB_RUN_NUMBER}|; s|@APK@|${APK_NAME}|" get-vethos.sh
-          sh -n get-vethos.sh   # syntax check
+          chmod +x get-vethos.sh
+          sh -n get-vethos.sh
 
-          ls -l
-
-      # Zip artifact (CRC ke saath). Nested zip se bachne ke liye folder upload ho raha hai
-      - name: Upload artifact (zip, CRC checked)
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: Vethos-debug
@@ -290,7 +208,7 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      - name: Publish to Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: vethos-build-${{ github.run_number }}
@@ -305,45 +223,50 @@ jobs:
             dist/parts.sha256
             dist/get-vethos.sh
 
-      # Release se wapas download karke hash match karo (server side corruption check)
-      - name: Verify Release download (round trip)
+      - name: Verify release download checksum
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
-          TAG="vethos-build-${{ github.run_number }}"
-          sleep 5
+          TAG="vethos-build-${GITHUB_RUN_NUMBER}"
           for i in 1 2 3 4 5; do
             rm -rf check && mkdir check
-            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$APK_NAME" -p "$APK_NAME.sha256" -D check \
-               && (cd check && sha256sum -c "$APK_NAME.sha256"); then
-              echo "Round trip OK"; break
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              -p "$APK_NAME" -p "$APK_NAME.sha256" -D check \
+              && (cd check && sha256sum -c "$APK_NAME.sha256"); then
+              echo "Release round-trip checksum OK"; exit 0
             fi
-            [ "$i" = 5 ] && { echo "::error::Release APK hash mismatch"; exit 1; }
             sleep 5
           done
+          echo "::error::Release APK checksum verification failed"
+          exit 1
 
-      - name: Job summary (copy-paste Termux command)
+      - name: Job summary
+        shell: bash
         run: |
-          TAG="vethos-build-${{ github.run_number }}"
+          TAG="vethos-build-${GITHUB_RUN_NUMBER}"
           HASH=$(cut -d' ' -f1 "dist/$APK_NAME.sha256")
           {
-            echo "## Vethos APK ready"
+            echo '## Vethos APK ready'
             echo
-            echo "SHA256: \`$HASH\`"
+            echo "SHA256: $HASH"
             echo
             echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
             echo
-            echo "Termux (auto-retry + verify):"
-            echo '```'
-            echo "pkg install wget -y"
+            echo 'Termux:'
+            echo '```sh'
+            echo 'pkg install wget -y'
             echo "wget https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/get-vethos.sh"
-            echo "sh get-vethos.sh"
+            echo 'sh get-vethos.sh'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Show only the real errors
+      - name: Show useful build errors
         if: failure()
+        shell: bash
         run: |
-          grep -nE "error:|e: |FAILED|What went wrong|CMake Error|undefined reference|fatal error" build.log | head -60 || true
-          tail -40 build.log
+          if [[ -f build.log ]]; then
+            grep -nE 'error:|e: |FAILED|What went wrong|CMake Error|undefined reference|fatal error' build.log | head -60 || true
+            tail -40 build.log
+          fi
